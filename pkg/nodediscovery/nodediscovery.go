@@ -179,6 +179,39 @@ func (n *NodeDiscovery) StartDiscovery() {
 	n.localNodeLock.Lock()
 	defer n.localNodeLock.Unlock()
 
+	n.fillLocalNode()
+
+	go func() {
+		log.WithFields(
+			logrus.Fields{
+				logfields.Node: n.localNode,
+			}).Info("Adding local node to cluster")
+		for {
+			if err := n.Registrar.RegisterNode(&n.localNode, n.Manager); err != nil {
+				log.WithError(err).Error("Unable to initialize local node. Retrying...")
+				time.Sleep(time.Second)
+			} else {
+				break
+			}
+		}
+		close(n.Registered)
+	}()
+
+	go func() {
+		select {
+		case <-n.Registered:
+		case <-time.NewTimer(defaults.NodeInitTimeout).C:
+			log.Fatalf("Unable to initialize local node due to timeout")
+		}
+	}()
+
+	n.Manager.NodeUpdated(n.localNode)
+	close(n.LocalStateInitialized)
+
+	n.updateLocalNode()
+}
+
+func (n *NodeDiscovery) fillLocalNode() {
 	n.localNode.Name = nodeTypes.GetName()
 	n.localNode.Cluster = option.Config.ClusterName
 	n.localNode.IPAddresses = []nodeTypes.Address{}
@@ -233,34 +266,9 @@ func (n *NodeDiscovery) StartDiscovery() {
 			IP:   node.GetK8sExternalIPv6(),
 		})
 	}
+}
 
-	go func() {
-		log.WithFields(
-			logrus.Fields{
-				logfields.Node: n.localNode,
-			}).Info("Adding local node to cluster")
-		for {
-			if err := n.Registrar.RegisterNode(&n.localNode, n.Manager); err != nil {
-				log.WithError(err).Error("Unable to initialize local node. Retrying...")
-				time.Sleep(time.Second)
-			} else {
-				break
-			}
-		}
-		close(n.Registered)
-	}()
-
-	go func() {
-		select {
-		case <-n.Registered:
-		case <-time.NewTimer(defaults.NodeInitTimeout).C:
-			log.Fatalf("Unable to initialize local node due to timeout")
-		}
-	}()
-
-	n.Manager.NodeUpdated(n.localNode)
-	close(n.LocalStateInitialized)
-
+func (n *NodeDiscovery) updateLocalNode() {
 	if option.Config.KVStore != "" && !option.Config.JoinCluster {
 		go func() {
 			<-n.Registered
@@ -282,6 +290,17 @@ func (n *NodeDiscovery) StartDiscovery() {
 		// to avoid custom resource update conflicts.
 		n.UpdateCiliumNodeResource()
 	}
+}
+
+func (n *NodeDiscovery) UpdateLocalNode(fillLocalNode bool) {
+	n.localNodeLock.Lock()
+	defer n.localNodeLock.Unlock()
+
+	if fillLocalNode {
+		n.fillLocalNode()
+	}
+
+	n.updateLocalNode()
 }
 
 // Close shuts down the node discovery engine
