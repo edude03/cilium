@@ -33,6 +33,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sTypes "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/mtu"
@@ -69,6 +70,8 @@ type NodeDiscovery struct {
 	Registered            chan struct{}
 	LocalStateInitialized chan struct{}
 	NetConf               *cnitypes.NetConf
+
+	localNodeLock lock.Mutex
 }
 
 func enableLocalNodeRoute() bool {
@@ -172,8 +175,44 @@ func (n *NodeDiscovery) JoinCluster(nodeName string) {
 // start configures the local node and starts node discovery. This is called on
 // agent startup to configure the local node based on the configuration options
 // passed to the agent. nodeName is the name to be used in the local agent.
-func (n *NodeDiscovery) StartDiscovery(nodeName string) {
-	n.LocalNode.Name = nodeName
+func (n *NodeDiscovery) StartDiscovery() {
+	n.localNodeLock.Lock()
+	defer n.localNodeLock.Unlock()
+
+	n.fillLocalNode()
+
+	go func() {
+		log.WithFields(
+			logrus.Fields{
+				logfields.Node: n.LocalNode,
+			}).Info("Adding local node to cluster")
+		for {
+			if err := n.Registrar.RegisterNode(&n.LocalNode, n.Manager); err != nil {
+				log.WithError(err).Error("Unable to initialize local node. Retrying...")
+				time.Sleep(time.Second)
+			} else {
+				break
+			}
+		}
+		close(n.Registered)
+	}()
+
+	go func() {
+		select {
+		case <-n.Registered:
+		case <-time.NewTimer(defaults.NodeInitTimeout).C:
+			log.Fatalf("Unable to initialize local node due to timeout")
+		}
+	}()
+
+	n.Manager.NodeUpdated(n.LocalNode)
+	close(n.LocalStateInitialized)
+
+	n.updateLocalNode()
+}
+
+func (n *NodeDiscovery) fillLocalNode() {
+	n.LocalNode.Name = nodeTypes.GetName()
 	n.LocalNode.Cluster = option.Config.ClusterName
 	n.LocalNode.IPAddresses = []nodeTypes.Address{}
 	n.LocalNode.IPv4AllocCIDR = node.GetIPv4AllocRange()
@@ -224,34 +263,9 @@ func (n *NodeDiscovery) StartDiscovery(nodeName string) {
 			IP:   node.GetK8sExternalIPv6(),
 		})
 	}
+}
 
-	go func() {
-		log.WithFields(
-			logrus.Fields{
-				logfields.Node: n.LocalNode,
-			}).Info("Adding local node to cluster")
-		for {
-			if err := n.Registrar.RegisterNode(&n.LocalNode, n.Manager); err != nil {
-				log.WithError(err).Error("Unable to initialize local node. Retrying...")
-				time.Sleep(time.Second)
-			} else {
-				break
-			}
-		}
-		close(n.Registered)
-	}()
-
-	go func() {
-		select {
-		case <-n.Registered:
-		case <-time.NewTimer(defaults.NodeInitTimeout).C:
-			log.Fatalf("Unable to initialize local node due to timeout")
-		}
-	}()
-
-	n.Manager.NodeUpdated(n.LocalNode)
-	close(n.LocalStateInitialized)
-
+func (n *NodeDiscovery) updateLocalNode() {
 	if option.Config.KVStore != "" && !option.Config.JoinCluster {
 		go func() {
 			<-n.Registered
@@ -273,6 +287,14 @@ func (n *NodeDiscovery) StartDiscovery(nodeName string) {
 		// to avoid custom resource update conflicts.
 		n.UpdateCiliumNodeResource()
 	}
+}
+
+func (n *NodeDiscovery) UpdateLocalNode(fillLocalNode bool) {
+	if fillLocalNode {
+		n.fillLocalNode()
+	}
+
+	n.updateLocalNode()
 }
 
 // Close shuts down the node discovery engine
