@@ -7,6 +7,7 @@ package ipsec
 
 import (
 	"bufio"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -16,12 +17,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/fswatcher"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/encrypt"
+	"github.com/cilium/cilium/pkg/node"
+	"github.com/cilium/cilium/pkg/nodediscovery"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -619,4 +625,45 @@ func DeleteIPsecEncryptRoute() {
 			}
 		}
 	}
+}
+
+func keyfileWatcher(ctx context.Context, watcher *fswatcher.Watcher, keyfilePath string, nodediscovery *nodediscovery.NodeDiscovery) {
+	for {
+		select {
+		case event := <-watcher.Events:
+			if event.Name != keyfilePath {
+				continue
+			}
+
+			log.WithField(logfields.Path, keyfilePath).Debugf("Received %s fsnotify event for IPSec keyfile", event.Op.String())
+			if event.Op&(fsnotify.Create|fsnotify.Write) == 0 {
+				continue
+			}
+
+			_, spi, err := LoadIPSecKeysFile(keyfilePath)
+			if err != nil {
+				log.WithError(err).Errorf("Failed to load IPsec keyfile")
+			}
+
+			node.SetIPsecKeyIdentity(spi)
+			nodediscovery.UpdateLocalNode(true)
+
+		case err := <-watcher.Errors:
+			log.WithError(err).WithField("path", keyfilePath).Warning("error encountered while watching file with fsnotify")
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func StartKeyfileWatcher(ctx context.Context, keyfilePath string, nodediscovery *nodediscovery.NodeDiscovery) error {
+	watcher, err := fswatcher.New([]string{keyfilePath})
+	if err != nil {
+		return err
+	}
+
+	go keyfileWatcher(ctx, watcher, keyfilePath, nodediscovery)
+
+	return nil
 }
